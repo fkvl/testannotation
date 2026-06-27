@@ -234,19 +234,25 @@ def load_transcript(sheet_id: str, tab_name: str) -> pd.DataFrame:
     df = pd.DataFrame(rows[1:], columns=header)
     df.columns = df.columns.str.strip().str.lower()
 
-    # Flexible column mapping
+
+    # Exact AnnoMI column mapping — handles utterance_text, transcript_id etc cleanly
     rename = {}
-    for c in df.columns:
-        if any(x in c for x in ["utt", "#", "id"]) and "interlocutor" not in c:
-            rename[c] = "utterance_id"
-        elif "interlocutor" in c or "speaker" in c or "role" in c:
-            rename[c] = "interlocutor"
-        elif "text" in c or "utterance" in c:
-            rename[c] = "text"
-        elif "timestamp" in c or "time" in c:
-            rename[c] = "timestamp"
-        elif "topic" in c:
-            rename[c] = "topic"
+    col_list = df.columns.tolist()
+    if "utterance_id"   in col_list: rename["utterance_id"]   = "utterance_id"
+    if "utterance_text" in col_list: rename["utterance_text"] = "text"
+    if "interlocutor"   in col_list: rename["interlocutor"]   = "interlocutor"
+    if "timestamp"      in col_list: rename["timestamp"]      = "timestamp"
+    if "topic"          in col_list: rename["topic"]          = "topic"
+    # fallbacks for non-AnnoMI column names
+    if "utterance_id" not in col_list:
+        for c in col_list:
+            if "utt" in c and "text" not in c: rename[c] = "utterance_id"; break
+    if "text" not in [rename.get(c) for c in col_list]:
+        for c in col_list:
+            if "text" in c: rename[c] = "text"; break
+    if "interlocutor" not in col_list:
+        for c in col_list:
+            if "speaker" in c or "role" in c: rename[c] = "interlocutor"; break
     df.rename(columns=rename, inplace=True)
 
     for col in ["utterance_id", "interlocutor", "text", "timestamp", "topic"]:
