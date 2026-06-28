@@ -1,5 +1,5 @@
 """
-mpathic Annotation Tool - proof of concept to connect to gsheets without them downloading data
+mpathic Annotation Tool - proof of concept for gsheets so downloading
 -----------------------
 Loads one transcript at a time for speed.
 Auth: GCP service account JSON key (paste raw JSON into secrets).
@@ -181,9 +181,10 @@ HEADER_ROW = ["Transcript ID", "Utterance ID", "Interlocutor", "Text",
               "Annotator", "Timestamp"]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SOURCE_SHEET_ID = st.secrets.get("SOURCE_SHEET_ID", "")
-OUTPUT_SHEET_ID = st.secrets.get("OUTPUT_SHEET_ID", "")
-SOURCE_TAB      = st.secrets.get("SOURCE_TAB", "Sheet1")
+ANNOTATOR_PASSWORD = st.secrets.get("ANNOTATOR_PASSWORD", "mpathic2024")
+SOURCE_SHEET_ID    = st.secrets.get("SOURCE_SHEET_ID", "")
+OUTPUT_SHEET_ID    = st.secrets.get("OUTPUT_SHEET_ID", "")
+SOURCE_TAB         = st.secrets.get("SOURCE_TAB", "Sheet1")
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -382,15 +383,18 @@ def show_login():
         st.markdown('<div class="login-logo">mpathic</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-sub">Annotation Tool</div>', unsafe_allow_html=True)
         name = st.text_input("Annotator name / ID")
+        pwd  = st.text_input("Password", type="password")
         if st.button("Sign In", use_container_width=True):
-            if name.strip():
+            if pwd == ANNOTATOR_PASSWORD and name.strip():
                 st.session_state.authenticated  = True
                 st.session_state.annotator_name = name.strip()
                 st.session_state.transcript_id  = None
                 st.session_state.loaded_tid     = None
                 st.rerun()
-            else:
+            elif not name.strip():
                 st.error("Enter your annotator name.")
+            else:
+                st.error("Incorrect password.")
 
 
 # ── TRANSCRIPT PICKER ──────────────────────────────────────────────────────────
