@@ -87,6 +87,7 @@ div[data-testid="stHorizontalBlock"] .stButton > button:hover {
 .chip-sub    { background: #f0fffe; color: #1d8587; border: 1.5px solid #67dedf; }
 .chip-client { background: #f0fffe; color: #1d8587; border: 1.5px solid #67dedf; }
 .chip-empty  { background: #f4f4f4; color: #aaa;    border: 1.5px solid #e0e0e0; }
+.chip-done   { background: #eefaee; color: #3c8a07; border: 1.5px solid #66bb03; }
 .saved-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; border-radius: 6px; padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
 .transcript-card {
     background: #F9F8F8; border: 1px solid #e8e8e8; border-radius: 10px;
@@ -180,6 +181,18 @@ HEADER_ROW = ["Transcript ID", "Utterance ID", "Interlocutor", "Text",
               "Main Behaviour", "Subtype", "Client Talk Type", "Notes",
               "Annotator", "Timestamp"]
 
+# Fixed column positions in the output tab. Rows are ALWAYS written in HEADER_ROW
+# order, so reading saved labels back by position is robust even if the header
+# text in the sheet differs (older format, hand-edits, stray spaces, etc.).
+COL = {name: i for i, name in enumerate(HEADER_ROW)}
+
+def _norm_id(x) -> str:
+    """Normalise a transcript/utterance id for comparison ('5', ' 5 ', '5.0' → '5')."""
+    s = str(x).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 ANNOTATOR_PASSWORD = st.secrets.get("ANNOTATOR_PASSWORD", "mpathic2024")
 SOURCE_SHEET_ID    = st.secrets.get("SOURCE_SHEET_ID", "")
@@ -265,10 +278,13 @@ def load_one_transcript(sheet_id: str, tab: str, transcript_id: str) -> pd.DataF
 
 
 # ── Load this annotator's previously saved labels for a transcript ────────────
-@st.cache_data(ttl=120, show_spinner=False)
+# NOT cached: always reads straight from the output tab so a reopened transcript
+# (including after logout/login) reflects exactly what is on the sheet.
 def load_existing_annotations(out_tab: str, transcript_id: str) -> dict:
-    """Reads back saved labels so reopened transcripts show prior work.
-    Sheet is append-only, so the last row for each utterance wins (most recent)."""
+    """Read saved labels for one transcript from this annotator's output tab.
+    Reads by COLUMN POSITION (rows are written in HEADER_ROW order), so it works
+    regardless of the sheet's header text. Append-only → last row per utterance
+    wins (most recent save)."""
     gc = get_gc()
     if gc is None:
         return {}
@@ -277,25 +293,24 @@ def load_existing_annotations(out_tab: str, transcript_id: str) -> dict:
         try:
             ws = sh.worksheet(out_tab)
         except gspread.WorksheetNotFound:
-            return {}  # nothing saved yet for this annotator
+            return {}  # nothing saved yet for this annotator / source tab
         vals = ws.get_all_values()
         if len(vals) < 2:
             return {}
-        header = vals[0]
-        col = {name: i for i, name in enumerate(header)}
 
         def cell(row, name):
-            i = col.get(name)
-            return row[i] if (i is not None and i < len(row)) else ""
+            i = COL[name]
+            return row[i].strip() if i < len(row) else ""
 
+        target = _norm_id(transcript_id)
         out = {}
-        for r in vals[1:]:
-            if str(cell(r, "Transcript ID")) != str(transcript_id):
+        for r in vals[1:]:                       # skip header row
+            if _norm_id(cell(r, "Transcript ID")) != target:
                 continue
-            uid = str(cell(r, "Utterance ID"))
+            uid = cell(r, "Utterance ID")
             if not uid:
                 continue
-            out[uid] = {  # later rows overwrite earlier → keeps most recent save
+            out[uid] = {                         # later row overwrites → most recent
                 "main_behaviour":   cell(r, "Main Behaviour"),
                 "subtype":          cell(r, "Subtype"),
                 "client_talk_type": cell(r, "Client Talk Type"),
@@ -304,6 +319,46 @@ def load_existing_annotations(out_tab: str, transcript_id: str) -> dict:
         return out
     except Exception as e:
         st.error(f"Could not load saved annotations: {e}")
+        return {}
+
+
+# ── Per-transcript labeled counts for this annotator (for the picker) ─────────
+@st.cache_data(ttl=60, show_spinner=False)
+def load_annotated_counts(out_tab: str) -> dict:
+    """{transcript_id: number_of_labeled_utterances} for this annotator's tab.
+    'Labeled' = has a Main Behaviour or a Client Talk Type. Best-effort; never
+    raises into the picker. Cleared on save so progress stays current."""
+    gc = get_gc()
+    if gc is None:
+        return {}
+    try:
+        sh = gc.open_by_key(OUTPUT_SHEET_ID)
+        try:
+            ws = sh.worksheet(out_tab)
+        except gspread.WorksheetNotFound:
+            return {}
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            return {}
+
+        def cell(row, name):
+            i = COL[name]
+            return row[i].strip() if i < len(row) else ""
+
+        latest = {}  # (transcript_id, utterance_id) → is_labeled, last row wins
+        for r in vals[1:]:
+            tid = _norm_id(cell(r, "Transcript ID"))
+            uid = cell(r, "Utterance ID")
+            if not tid or not uid:
+                continue
+            latest[(tid, uid)] = bool(cell(r, "Main Behaviour") or cell(r, "Client Talk Type"))
+
+        counts = {}
+        for (tid, _uid), labeled in latest.items():
+            if labeled:
+                counts[tid] = counts.get(tid, 0) + 1
+        return counts
+    except Exception:
         return {}
 
 
@@ -430,6 +485,9 @@ def show_transcript_picker():
         st.error("Could not load transcript list. Check your Sheet ID and tab name in secrets.")
         return
 
+    # Saved progress for this annotator (read back from the output tab)
+    counts = load_annotated_counts(out_tab_name(st.session_state.annotator_name))
+
     tid_col   = "transcript_id"
     topic_col = "topic" if "topic" in index.columns else None
 
@@ -451,12 +509,18 @@ def show_transcript_picker():
             f'<span style="color:#777;font-size:0.85rem;margin-left:0.7rem;">{topic}</span>'
             if topic else ""
         )
+        n = counts.get(_norm_id(tid), 0)
+        labeled_html = (
+            f'<span class="chip chip-done" style="margin-left:0.7rem;">{n} labeled</span>'
+            if n else ""
+        )
         col1, col2 = st.columns([4, 1])
         with col1:
             st.markdown(
                 f'<div style="padding:0.6rem 0;">'
                 f'<span style="font-weight:700;color:#111;">Transcript {tid}</span>'
                 f'{topic_html}'
+                f'{labeled_html}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -671,8 +735,8 @@ def show_annotation():
         st.session_state.annotations[uid] = current_ann
         with st.spinner("Saving…"):
             save_annotation(out_tab, tid, uid, current_ann, who, text)
-        # bust the read cache so a later reopen reflects this save
-        load_existing_annotations.clear()
+        # refresh the picker's saved-progress counts after a write
+        load_annotated_counts.clear()
         if advance and idx < total - 1:
             st.session_state.current_idx += 1
 
