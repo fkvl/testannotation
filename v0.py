@@ -1,10 +1,11 @@
 """
-mpathic Annotation Tool — Motivational Interviewing Edition
------------------------------------------------------------
+mpathic Annotation Tool - proof of concept to connect to gsheets without them downloading data
+-----------------------
 Loads one transcript at a time for speed.
 Auth: GCP service account JSON key (paste raw JSON into secrets).
 Each annotator gets their own output tab: {source_tab}_{annotator}_labels
 Annotations are appended (not upserted) — fast, no column scanning.
+Previously saved labels are reloaded when a transcript is reopened.
 """
 
 import streamlit as st
@@ -16,7 +17,7 @@ from datetime import datetime
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="mpathic · MI Annotation",
+    page_title="mpathic Annotation",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -87,7 +88,6 @@ div[data-testid="stHorizontalBlock"] .stButton > button:hover {
 .chip-client { background: #f0fffe; color: #1d8587; border: 1.5px solid #67dedf; }
 .chip-empty  { background: #f4f4f4; color: #aaa;    border: 1.5px solid #e0e0e0; }
 .saved-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; border-radius: 6px; padding: 0.3rem 0.7rem; font-size: 0.78rem; font-weight: 600; }
-.tab-badge   { display: inline-block; background: #fff0fb; color: #8f006b; border: 1px solid #ffb1ff; border-radius: 6px; padding: 0.2rem 0.6rem; font-size: 0.72rem; font-weight: 700; font-family: monospace; }
 .transcript-card {
     background: #F9F8F8; border: 1px solid #e8e8e8; border-radius: 10px;
     padding: 1.25rem 1.5rem; margin-bottom: 0.5rem; cursor: pointer;
@@ -109,12 +109,30 @@ hr { border-color: #e8e8e8 !important; }
 h1,h2,h3,h4 { font-family: 'Rubik', sans-serif !important; font-weight: 800 !important; }
 .login-logo { font-size: 2.5rem; font-weight: 900; letter-spacing: -1.5px; color: #ff00c1; -webkit-text-fill-color: #ff00c1; }
 .login-sub  { font-size: 0.72rem; font-weight: 500; letter-spacing: 2px; text-transform: uppercase; color: #999; margin-bottom: 2.5rem; }
-.login-note { font-size: 0.78rem; color: #aaa; margin-top: 1rem; text-align: center; }
+
+/* Hover help "?" badge */
+.mp-help { position: relative; display: inline-block; margin-bottom: 0.5rem; }
+.mp-help > .q {
+    width: 24px; height: 24px; line-height: 22px; text-align: center;
+    display: inline-block; border-radius: 50%;
+    border: 1.5px solid #ff00c1; color: #ff00c1; background: #fff;
+    font-weight: 700; font-size: 0.9rem; cursor: help; user-select: none;
+}
+.mp-help .tip {
+    visibility: hidden; opacity: 0; transition: opacity .12s ease;
+    position: absolute; top: 30px; left: 0; z-index: 99999;
+    width: 250px; background: #fff; color: #555;
+    border: 1px solid #e8e8e8; border-radius: 10px;
+    padding: 0.85rem 1rem; box-shadow: 0 10px 30px rgba(143,0,107,0.15);
+    font-size: 0.74rem; line-height: 1.85; font-weight: 400;
+}
+.mp-help:hover .tip { visibility: visible; opacity: 1; }
+.mp-help .tip b { font-weight: 700; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── MI Label taxonomy ──────────────────────────────────────────────────────────
+# ── Label taxonomy ─────────────────────────────────────────────────────────────
 THERAPIST_MAIN = {
     "question":        {"label": "Question",        "color": "#ff00c1", "subtypes": ["open", "closed"]},
     "reflection":      {"label": "Reflection",      "color": "#d4006e", "subtypes": ["simple", "complex"]},
@@ -127,6 +145,33 @@ CLIENT_TALK_TYPES = {
     "neutral": {"label": "Neutral",      "color": "#999"},
 }
 
+# Speaker detection: anything matching these hints is treated as the therapist;
+# everything else (incl. blank/unknown) is treated as the client so Client Talk
+# Type buttons reliably appear.
+THERAPIST_HINTS = (
+    "therapist", "counselor", "counsellor", "clinician", "provider",
+    "interviewer", "doctor", "dr", "coach", "practitioner", "facilitator",
+)
+
+def is_therapist_speaker(who: str) -> bool:
+    w = (who or "").strip().lower()
+    return any(h in w for h in THERAPIST_HINTS)
+
+# Hover tooltip content for the "?" help badge
+LABEL_HELP_HTML = """<div class="mp-help"><span class="q">?</span>
+<div class="tip">
+<b style="color:#ff00c1;">Question</b> — Open / Closed<br>
+<b style="color:#d4006e;">Reflection</b> — Simple / Complex<br>
+<b style="color:#8f006b;">Therapist Input</b> — Info / Advice / Options / Negotiation<br>
+<b style="color:#aaa;">Other</b><br>
+<br>
+<b style="color:#1d8587;">Change Talk</b> — toward change<br>
+<b style="color:#f3ac02;">Sustain Talk</b> — resists change<br>
+<b style="color:#999;">Neutral</b><br>
+<br>
+<span style="color:#aaa;font-style:italic;">Client talk appears on client turns.</span>
+</div></div>"""
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
@@ -136,10 +181,9 @@ HEADER_ROW = ["Transcript ID", "Utterance ID", "Interlocutor", "Text",
               "Annotator", "Timestamp"]
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-ANNOTATOR_PASSWORD = st.secrets.get("ANNOTATOR_PASSWORD", "mpathic2024")
-SOURCE_SHEET_ID    = st.secrets.get("SOURCE_SHEET_ID", "")
-OUTPUT_SHEET_ID    = st.secrets.get("OUTPUT_SHEET_ID", "")
-SOURCE_TAB         = st.secrets.get("SOURCE_TAB", "Sheet1")
+SOURCE_SHEET_ID = st.secrets.get("SOURCE_SHEET_ID", "")
+OUTPUT_SHEET_ID = st.secrets.get("OUTPUT_SHEET_ID", "")
+SOURCE_TAB      = st.secrets.get("SOURCE_TAB", "Sheet1")
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
@@ -164,13 +208,11 @@ def load_transcript_index(sheet_id: str, tab: str) -> pd.DataFrame:
         return pd.DataFrame()
     try:
         ws   = gc.open_by_key(sheet_id).worksheet(tab)
-        # Get just the header + transcript_id + topic columns
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
             return pd.DataFrame()
         header = [h.strip().lower() for h in all_vals[0]]
         df = pd.DataFrame(all_vals[1:], columns=header)
-        # Find transcript_id and topic columns
         tid_col   = next((c for c in df.columns if c == "transcript_id"), None)
         topic_col = next((c for c in df.columns if c == "topic"), None)
         if not tid_col:
@@ -198,12 +240,10 @@ def load_one_transcript(sheet_id: str, tab: str, transcript_id: str) -> pd.DataF
             return pd.DataFrame()
         header = [h.strip().lower() for h in all_vals[0]]
         df = pd.DataFrame(all_vals[1:], columns=header)
-        # Filter to this transcript
         tid_col = next((c for c in df.columns if c == "transcript_id"), None)
         if not tid_col:
             return pd.DataFrame()
         df = df[df[tid_col].astype(str) == str(transcript_id)].reset_index(drop=True)
-        # Rename to standard names
         rename = {}
         for c in df.columns:
             if c == "utterance_id":    rename[c] = "utterance_id"
@@ -221,6 +261,49 @@ def load_one_transcript(sheet_id: str, tab: str, transcript_id: str) -> pd.DataF
     except Exception as e:
         st.error(f"Could not load transcript: {e}")
         return pd.DataFrame()
+
+
+# ── Load this annotator's previously saved labels for a transcript ────────────
+@st.cache_data(ttl=120, show_spinner=False)
+def load_existing_annotations(out_tab: str, transcript_id: str) -> dict:
+    """Reads back saved labels so reopened transcripts show prior work.
+    Sheet is append-only, so the last row for each utterance wins (most recent)."""
+    gc = get_gc()
+    if gc is None:
+        return {}
+    try:
+        sh = gc.open_by_key(OUTPUT_SHEET_ID)
+        try:
+            ws = sh.worksheet(out_tab)
+        except gspread.WorksheetNotFound:
+            return {}  # nothing saved yet for this annotator
+        vals = ws.get_all_values()
+        if len(vals) < 2:
+            return {}
+        header = vals[0]
+        col = {name: i for i, name in enumerate(header)}
+
+        def cell(row, name):
+            i = col.get(name)
+            return row[i] if (i is not None and i < len(row)) else ""
+
+        out = {}
+        for r in vals[1:]:
+            if str(cell(r, "Transcript ID")) != str(transcript_id):
+                continue
+            uid = str(cell(r, "Utterance ID"))
+            if not uid:
+                continue
+            out[uid] = {  # later rows overwrite earlier → keeps most recent save
+                "main_behaviour":   cell(r, "Main Behaviour"),
+                "subtype":          cell(r, "Subtype"),
+                "client_talk_type": cell(r, "Client Talk Type"),
+                "notes":            cell(r, "Notes"),
+            }
+        return out
+    except Exception as e:
+        st.error(f"Could not load saved annotations: {e}")
+        return {}
 
 
 # ── Output worksheet ───────────────────────────────────────────────────────────
@@ -274,6 +357,7 @@ for k, v in {
     "transcript_id":    None,   # currently selected transcript
     "annotations":      {},     # {uid: {main_behaviour, subtype, client_talk_type, notes}}
     "current_idx":      0,
+    "loaded_tid":       None,   # which transcript's saved labels are loaded into session
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -296,27 +380,25 @@ def show_login():
     with col:
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.markdown('<div class="login-logo">mpathic</div>', unsafe_allow_html=True)
-        st.markdown('<div class="login-sub">MI Annotation Tool</div>', unsafe_allow_html=True)
-        name = st.text_input("Annotator name / ID", placeholder="e.g. jane_doe")
-        pwd  = st.text_input("Password", type="password")
+        st.markdown('<div class="login-sub">Annotation Tool</div>', unsafe_allow_html=True)
+        name = st.text_input("Annotator name / ID")
         if st.button("Sign In", use_container_width=True):
-            if pwd == ANNOTATOR_PASSWORD and name.strip():
+            if name.strip():
                 st.session_state.authenticated  = True
                 st.session_state.annotator_name = name.strip()
                 st.session_state.transcript_id  = None
+                st.session_state.loaded_tid     = None
                 st.rerun()
-            elif not name.strip():
-                st.error("Enter your annotator name.")
             else:
-                st.error("Incorrect password.")
-        st.markdown('<p class="login-note">🔒 Transcript data is read-only.</p>', unsafe_allow_html=True)
+                st.error("Enter your annotator name.")
 
 
 # ── TRANSCRIPT PICKER ──────────────────────────────────────────────────────────
 def show_transcript_picker():
     with st.sidebar:
+        st.markdown(LABEL_HELP_HTML, unsafe_allow_html=True)
         st.markdown('<div class="brand-logo">mpathic</div>', unsafe_allow_html=True)
-        st.markdown('<div class="brand-tag">MI Annotation Tool</div>', unsafe_allow_html=True)
+        st.markdown('<div class="brand-tag">Annotation Tool</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Session</div>', unsafe_allow_html=True)
         st.markdown(f"**{st.session_state.annotator_name}**")
         st.markdown("---")
@@ -325,6 +407,7 @@ def show_transcript_picker():
             st.session_state.annotator_name = ""
             st.session_state.transcript_id  = None
             st.session_state.annotations    = {}
+            st.session_state.loaded_tid     = None
             st.rerun()
 
     st.markdown("""
@@ -360,12 +443,16 @@ def show_transcript_picker():
     for _, row in index.iterrows():
         tid   = str(row[tid_col])
         topic = str(row[topic_col]).replace("_", " ").title() if topic_col else ""
+        topic_html = (
+            f'<span style="color:#777;font-size:0.85rem;margin-left:0.7rem;">{topic}</span>'
+            if topic else ""
+        )
         col1, col2 = st.columns([4, 1])
         with col1:
             st.markdown(
                 f'<div style="padding:0.6rem 0;">'
                 f'<span style="font-weight:700;color:#111;">Transcript {tid}</span>'
-                f'{"  ·  " + f"<span style=color:#777;font-size:0.85rem;>{topic}</span>" if topic else ""}'
+                f'{topic_html}'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -373,6 +460,7 @@ def show_transcript_picker():
             if st.button("Annotate →", key=f"pick_{tid}", use_container_width=True):
                 st.session_state.transcript_id = tid
                 st.session_state.annotations   = {}
+                st.session_state.loaded_tid    = None  # force reload of saved labels
                 st.session_state.current_idx   = 0
                 st.rerun()
 
@@ -405,41 +493,36 @@ def show_annotation():
     tid     = st.session_state.transcript_id
     out_tab = out_tab_name(st.session_state.annotator_name)
 
+    # Load this annotator's previously saved labels once per transcript entry
+    if st.session_state.loaded_tid != tid:
+        st.session_state.annotations = load_existing_annotations(out_tab, tid)
+        st.session_state.loaded_tid  = tid
+
     # ── Sidebar ────────────────────────────────────────────────────────────────
     with st.sidebar:
+        st.markdown(LABEL_HELP_HTML, unsafe_allow_html=True)
         st.markdown('<div class="brand-logo">mpathic</div>', unsafe_allow_html=True)
-        st.markdown('<div class="brand-tag">MI Annotation Tool</div>', unsafe_allow_html=True)
+        st.markdown('<div class="brand-tag">Annotation Tool</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Session</div>', unsafe_allow_html=True)
         st.markdown(f"**{st.session_state.annotator_name}**")
         st.markdown("---")
         st.markdown('<div class="section-label">Transcript</div>', unsafe_allow_html=True)
         st.markdown(f"**#{tid}**")
-        st.markdown(f'Saving to: <span class="tab-badge">{out_tab}</span>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("← Back to Transcripts", use_container_width=True):
             st.session_state.transcript_id = None
             st.session_state.annotations   = {}
+            st.session_state.loaded_tid    = None
             st.session_state.current_idx   = 0
             st.rerun()
-        st.markdown("---")
-        st.markdown('<div class="section-label">MI Label Guide</div>', unsafe_allow_html=True)
-        st.markdown("""<span style="font-size:0.75rem;color:#555;line-height:1.9;">
-<b style="color:#ff00c1;">Question</b> — Open / Closed<br>
-<b style="color:#d4006e;">Reflection</b> — Simple / Complex<br>
-<b style="color:#8f006b;">Therapist Input</b> — Info / Advice / Options / Negotiation<br>
-<b style="color:#aaa;">Other</b><br><br>
-<b style="color:#1d8587;">Change Talk</b> — toward change<br>
-<b style="color:#f3ac02;">Sustain Talk</b> — resists change<br>
-<b style="color:#999;">Neutral</b>
-</span>""", unsafe_allow_html=True)
         st.markdown("---")
         if st.button("Sign Out", use_container_width=True):
             st.session_state.authenticated  = False
             st.session_state.annotator_name = ""
             st.session_state.transcript_id  = None
             st.session_state.annotations    = {}
+            st.session_state.loaded_tid     = None
             st.rerun()
-        st.markdown('<span style="font-size:0.7rem;color:#aaa;">🔒 Source data is read-only.</span>', unsafe_allow_html=True)
 
     # ── Load this transcript ────────────────────────────────────────────────────
     with st.spinner(f"Loading transcript {tid}…"):
@@ -453,12 +536,19 @@ def show_annotation():
     topic = df["topic"].iloc[0] if "topic" in df.columns and df["topic"].iloc[0] else ""
 
     # ── Header ─────────────────────────────────────────────────────────────────
+    header_bits = []
+    if topic:
+        header_bits.append(topic.replace("_", " ").title())
+    header_bits.append(f"{total} utterances")
+    header_bits.append("Click labels, then Save & Next.")
+    header_sub = " &nbsp;—&nbsp; ".join(header_bits)
+
     st.markdown(f"""
     <h1 style="font-size:2rem;font-weight:900;margin-bottom:0.2rem;">
         Transcript <span style="color:#ff00c1;">#{tid}</span>
     </h1>
     <p style="color:#777;font-size:0.9rem;margin-top:0;margin-bottom:1.5rem;">
-        {topic.replace("_"," ").title() if topic else ""} &nbsp;·&nbsp; {total} utterances &nbsp;·&nbsp; Click labels, then Save & Next.
+        {header_sub}
     </p>
     """, unsafe_allow_html=True)
 
@@ -513,7 +603,7 @@ def show_annotation():
         uid       = str(cr["utterance_id"])
         who       = cr["interlocutor"].lower() if cr["interlocutor"] else "unknown"
         is_active = ci == idx
-        who_class = "therapist" if "therapist" in who else "client"
+        who_class = "therapist" if is_therapist_speaker(who) else "client"
         card_cls  = f"active-card {who_class}-active" if is_active else ""
         who_html  = (
             f'<span class="utt-who-{who_class}">{who.title()}</span>'
@@ -536,7 +626,7 @@ def show_annotation():
     ann  = get_ann(uid)
 
     st.markdown("---")
-    is_therapist = "therapist" in who
+    is_therapist = is_therapist_speaker(who)
 
     if is_therapist:
         st.markdown('<div class="label-group-title">Main Behaviour</div>', unsafe_allow_html=True)
@@ -577,12 +667,14 @@ def show_annotation():
         st.session_state.annotations[uid] = current_ann
         with st.spinner("Saving…"):
             save_annotation(out_tab, tid, uid, current_ann, who, text)
+        # bust the read cache so a later reopen reflects this save
+        load_existing_annotations.clear()
         if advance and idx < total - 1:
             st.session_state.current_idx += 1
 
     bc1, bc2 = st.columns(2)
     with bc1:
-        if st.button("💾  Save & Next", use_container_width=True):
+        if st.button("Save & Next", use_container_width=True):
             _save(advance=True)
             st.rerun()
     with bc2:
@@ -595,8 +687,7 @@ def show_annotation():
     already = bool(ann.get("main_behaviour") or ann.get("client_talk_type"))
     if already:
         st.markdown(
-            f'<span class="saved-badge">✅ #{uid} saved</span>'
-            f'&nbsp;&nbsp;<span style="font-size:0.78rem;color:#aaa;">→ <strong>{out_tab}</strong></span>',
+            f'<span class="saved-badge"> #{uid} saved</span>',
             unsafe_allow_html=True,
         )
     else:
