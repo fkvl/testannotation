@@ -475,7 +475,7 @@ def show_transcript_picker():
         Pick a <span style="color:#ff00c1;">Transcript</span>
     </h1>
     <p style="color:#777;font-size:0.9rem;margin-top:0;margin-bottom:1.5rem;">
-        Select a transcript to annotate. Each one loads in under a second.
+        Select a transcript to annotate.
     </p>
     """, unsafe_allow_html=True)
 
