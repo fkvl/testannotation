@@ -437,6 +437,7 @@ def show_login():
         st.markdown("<br><br>", unsafe_allow_html=True)
         st.markdown('<div class="login-logo">mpathic</div>', unsafe_allow_html=True)
         st.markdown('<div class="login-sub">Annotation Tool</div>', unsafe_allow_html=True)
+        st.markdown('<div class="login-sub" style="letter-spacing:1.5px;color:#ff00c1;font-size:0.8rem;font-weight:600;margin-bottom:1rem;">¡Justicia para la verdad fundamental!</div>', unsafe_allow_html=True)
         name = st.text_input("Annotator name / ID")
         pwd  = st.text_input("Password", type="password")
         if st.button("Sign In", use_container_width=True):
